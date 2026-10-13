@@ -1,0 +1,168 @@
+rules_version = '2';
+
+// まわしてがみ セキュリティルール
+// ・1対1のトークは本人どうしだけが読める
+// ・グループトークはメンバーだけが読める
+// ・admins コレクションに登録した管理者は、通報対応のために全体を見られる
+// ・banned コレクションに登録された人は書き込めない（利用停止）
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(me())); }
+    function isBanned() { return exists(/databases/$(database)/documents/banned/$(me())); }
+    function active() { return signedIn() && !isBanned(); }
+    function onlyChanged(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // 送るメッセージの形をチェック
+    function validMsg(d) {
+      return d.keys().hasOnly(['from', 'k', 'v', 't', 'likes'])
+        && d.from == me()
+        && d.t == request.time
+        && d.k in ['tpl', 'stp', 'txt']
+        && d.v is string && d.v.size() > 0 && d.v.size() <= 120
+        && d.likes == [];
+    }
+    // いいねは自分の分だけ付け外しできる
+    function likeToggleOnly() {
+      let before = resource.data.likes.toSet();
+      let after = request.resource.data.likes.toSet();
+      return onlyChanged(['likes'])
+        && after.difference(before).union(before.difference(after)).hasOnly([me()]);
+    }
+    // トーク一覧に出す「最後のメッセージ」
+    function validLast() {
+      let l = request.resource.data.last;
+      return l.keys().hasOnly(['from', 'text', 'at'])
+        && l.from == me() && l.at == request.time
+        && l.text is string && l.text.size() <= 80;
+    }
+    // 既読は自分の分だけ更新できる
+    function ownReadOnly() {
+      return onlyChanged(['reads'])
+        && request.resource.data.reads.diff(resource.data.reads).affectedKeys().hasOnly([me()]);
+    }
+
+    match /admins/{uid} {
+      allow read: if signedIn() && uid == me();
+      allow write: if false;
+    }
+
+    match /banned/{uid} {
+      allow read: if signedIn() && (uid == me() || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    match /users/{uid} {
+      function validProfile(d) {
+        return d.keys().hasOnly(['nick', 'av', 'pic', 'friends', 'joinedAt', 'picHidden', 'agreed'])
+          && d.nick is string && d.nick.size() >= 1 && d.nick.size() <= 12
+          && d.av is string && d.av.size() <= 8
+          && (!('pic' in d) || (d.pic is string && d.pic.size() <= 45000 && d.pic.matches('data:image/jpeg;base64,.*')))
+          && d.friends is list && d.friends.size() <= 300
+          && d.agreed == true;
+      }
+      // 1人ずつ見るのはログインした人ならOK、全員の一覧は管理者だけ
+      allow get: if signedIn();
+      allow list: if isAdmin();
+      allow create: if active() && uid == me()
+        && validProfile(request.resource.data)
+        && request.resource.data.picHidden == false;
+      allow update: if (active() && uid == me()
+                        && validProfile(request.resource.data)
+                        && request.resource.data.picHidden == resource.data.picHidden)
+                    || (isAdmin() && onlyChanged(['picHidden']));
+
+      // ブロックリストなど、本人だけが見られる設定
+      match /private/{docId} {
+        allow read, write: if signedIn() && uid == me();
+      }
+    }
+
+    match /groups/{code} {
+      allow get: if signedIn();
+      allow list: if signedIn() && (me() in resource.data.members || isAdmin());
+      allow create: if active()
+        && code.matches('^[A-Z0-9]{6}$')
+        && request.resource.data.keys().hasOnly(['name', 'owner', 'createdAt', 'members', 'last', 'reads'])
+        && request.resource.data.owner == me()
+        && request.resource.data.members == [me()]
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 20
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.last == null
+        && request.resource.data.reads == {};
+      allow update: if active() && (
+          // 参加：自分を最後に1人追加するだけ
+          (!(me() in resource.data.members)
+            && onlyChanged(['members'])
+            && resource.data.members.size() < 300
+            && request.resource.data.members == resource.data.members.concat([me()]))
+          // 退会：自分を外すだけ
+       || (me() in resource.data.members
+            && onlyChanged(['members'])
+            && request.resource.data.members.toSet() == resource.data.members.toSet().difference([me()].toSet()))
+       || (me() in resource.data.members && onlyChanged(['last']) && validLast())
+       || (me() in resource.data.members && ownReadOnly())
+      );
+
+      match /messages/{mid} {
+        function member() {
+          return signedIn() && me() in get(/databases/$(database)/documents/groups/$(code)).data.members;
+        }
+        allow read: if member() || isAdmin();
+        allow create: if active() && member() && validMsg(request.resource.data);
+        allow update: if (active() && member() && likeToggleOnly())
+                      || (isAdmin() && onlyChanged(['hidden']));
+      }
+    }
+
+    // 1対1：ドキュメントIDは2人のIDを並べて _ でつないだもの
+    match /dms/{pid} {
+      function pair() { return pid.split('_'); }
+      function inPair() { return signedIn() && me() in pair(); }
+
+      allow get: if inPair() || isAdmin();
+      allow list: if signedIn() && (me() in resource.data.members || isAdmin());
+      allow create: if active() && inPair()
+        && pair().size() == 2 && pair()[0] < pair()[1]
+        && request.resource.data.keys().hasOnly(['members', 'last', 'reads'])
+        && request.resource.data.members == pair()
+        && request.resource.data.last == null
+        && request.resource.data.reads == {};
+      allow update: if active() && inPair()
+        && ((onlyChanged(['last']) && validLast()) || ownReadOnly());
+
+      match /messages/{mid} {
+        function p() { return pid.split('_'); }
+        function other() { return p()[0] == request.auth.uid ? p()[1] : p()[0]; }
+        function likes(a, b) { return b in get(/databases/$(database)/documents/users/$(a)).data.friends; }
+        function blockedByOther() {
+          let s = /databases/$(database)/documents/users/$(other())/private/settings;
+          return exists(s) && me() in get(s).data.get('blocked', []);
+        }
+        allow read: if (signedIn() && me() in p()) || isAdmin();
+        allow create: if active() && me() in p()
+          && validMsg(request.resource.data)
+          && exists(/databases/$(database)/documents/dms/$(pid))
+          && !blockedByOther()
+          // 自由に書けるのは、おたがい仲良し登録している相手だけ
+          && (request.resource.data.k != 'txt' || (likes(me(), other()) && likes(other(), me())));
+        allow update: if (active() && me() in p() && likeToggleOnly())
+                      || (isAdmin() && onlyChanged(['hidden']));
+      }
+    }
+
+    match /reports/{rid} {
+      allow create: if active()
+        && request.resource.data.keys().hasOnly(['by', 'about', 'where', 'why', 'msg', 't', 'done'])
+        && request.resource.data.by == me()
+        && request.resource.data.t == request.time
+        && request.resource.data.done == false;
+      allow read: if isAdmin();
+      allow update: if isAdmin() && onlyChanged(['done']);
+    }
+  }
+}
